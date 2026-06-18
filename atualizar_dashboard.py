@@ -156,11 +156,26 @@ CABECALHOS = ["nota final", "eps (kri)"]
 
 
 def _linha_cabecalho(ws):
-    """Linha de cabeçalho das abas de risco (a que contém 'Fator de Risco')."""
-    for r in range(1, min(ws.max_row, 15) + 1):
+    """Linha de cabeçalho das abas de risco.
+
+    Primeiro procura a linha que contém 'Fator de Risco'. Se o modelo
+    mudar, cai para uma linha que tenha o cabeçalho da nota ('Nota Final'
+    ou 'EPS (KRI)') junto de vários outros cabeçalhos — assim não confunde
+    com o texto "Nota Final" que aparece como rótulo de linha (sozinho) na
+    coluna de fatores.
+    """
+    limite = min(ws.max_row, 15)
+    for r in range(1, limite + 1):
         for c in range(1, ws.max_column + 1):
             if _normalizar(ws.cell(row=r, column=c).value) == "fator de risco":
                 return r
+    # Fallback: linha com cabeçalho de nota e pelo menos 5 células preenchidas.
+    for r in range(1, limite + 1):
+        textos = [_normalizar(ws.cell(row=r, column=c).value)
+                  for c in range(1, ws.max_column + 1)]
+        preenchidas = sum(1 for t in textos if t)
+        if preenchidas >= 5 and any(t in CABECALHOS for t in textos):
+            return r
     return None
 
 
@@ -205,17 +220,43 @@ def extrair_nota(ws) -> float:
 
 
 def ler_riscos(caminho_kri: Path) -> dict[int, float]:
-    """Mapa {ID_Risco: nota} lido das 4 abas de risco da planilha de KRI."""
+    """Mapa {ID_Risco: nota} lido das 4 abas de risco da planilha de KRI.
+
+    A identificação das abas de risco é feita pelo CONTEÚDO (a aba tem a
+    linha de cabeçalho "Fator de Risco" e uma coluna "Nota Final"/"EPS
+    (KRI)"), independente do nome exato da aba. O ID do risco vem do número
+    no início do nome da aba ("1...", "2.", "3 -", ...); quando não há
+    número, os riscos são numerados na ordem em que aparecem na planilha.
+    """
     wb = openpyxl.load_workbook(caminho_kri, data_only=True)
+
+    abas_risco = [ws for ws in wb.worksheets if _localizar_coluna(ws) is not None]
+    if not abas_risco:
+        raise ValueError(
+            "Nenhuma aba de risco encontrada na planilha de KRI.\n"
+            f"  Abas disponíveis: {wb.sheetnames}\n"
+            "  (cada aba de risco deve ter a linha 'Fator de Risco' e a "
+            "coluna 'Nota Final' ou 'EPS (KRI)')."
+        )
+
     riscos: dict[int, float] = {}
-    for ws in wb.worksheets:
-        m = re.match(r"\s*([1-4])\s*-", ws.title)  # "1-...", "2- ...", "3 - ..."
-        if not m:
-            continue
-        id_risco = int(m.group(1))
+    usados: set[int] = set()
+    sem_id = []
+    for ws in abas_risco:
+        m = re.match(r"\s*([1-4])\b", ws.title)  # número no início do nome
+        if m and int(m.group(1)) not in usados:
+            id_risco = int(m.group(1))
+            riscos[id_risco] = extrair_nota(ws)
+            usados.add(id_risco)
+        else:
+            sem_id.append(ws)
+
+    # Abas sem número no nome recebem os IDs restantes, na ordem de aparição.
+    livres = [i for i in (1, 2, 3, 4) if i not in usados]
+    for ws, id_risco in zip(sem_id, livres):
         riscos[id_risco] = extrair_nota(ws)
-    if not riscos:
-        raise ValueError("Nenhuma aba de risco (1 a 4) encontrada na planilha de KRI.")
+        usados.add(id_risco)
+
     return riscos
 
 

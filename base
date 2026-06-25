@@ -1,18 +1,49 @@
+#!/usr/bin/env python3
 # ==============================================================================
 # ETL COMPLETO - Indicadores KRI Petros
 # Carrega: Indicadores [mês].xlsx + justificativas [mês].xlsx → indicadores_kri.db
+#
+# Versão robusta:
+#   - Schema criado/garantido automaticamente (CREATE IF NOT EXISTS + índices)
+#   - Carga ATÔMICA (delete + insert numa única transação; rollback em erro)
+#   - Backup seguro (ignora se o .db ainda não existe) + retenção/limpeza
+#   - Logging em console (emoji) e arquivo (auditoria)
+#   - CLI: escolher meses, pasta, banco, --dry-run, --no-backup, -v
+#   - Caminhos via pathlib + variáveis de ambiente (portável)
+#   - Relatório de qualidade dos dados ao final
+#
+# Uso rápido:
+#   python base                         # processa todos os meses configurados
+#   python base --meses janeiro fevereiro
+#   python base --dry-run -v            # ensaio, sem gravar nada
+#   KRI_PASTA_BASES=/dados KRI_DB=/dados/kri.db python base
 # ==============================================================================
+from __future__ import annotations
+
+import argparse
+import logging
 import os
 import shutil
 import sqlite3
+import sys
+from contextlib import closing
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
 import pandas as pd
 
 # ==============================================================================
-# 1. CONFIGURAÇÃO
+# 1. CONFIGURAÇÃO (com override por variável de ambiente)
 # ==============================================================================
-PASTA_BASES = r"F:\DADOS\GRC\Gestão de Riscos\0. Apartir de 2018\1. Equipe\21. Eduardo\Sinaleiro Estratégico\bases"
-CAMINHO_DB  = r"F:\DADOS\GRC\Gestão de Riscos\0. Apartir de 2018\1. Equipe\21. Eduardo\indicadores_kri.db"
+PASTA_BASES_PADRAO = r"F:\DADOS\GRC\Gestão de Riscos\0. Apartir de 2018\1. Equipe\21. Eduardo\Sinaleiro Estratégico\bases"
+CAMINHO_DB_PADRAO = r"F:\DADOS\GRC\Gestão de Riscos\0. Apartir de 2018\1. Equipe\21. Eduardo\indicadores_kri.db"
+
+PASTA_BASES = Path(os.environ.get("KRI_PASTA_BASES", PASTA_BASES_PADRAO))
+CAMINHO_DB = Path(os.environ.get("KRI_DB", CAMINHO_DB_PADRAO))
+
+# Quantos backups manter (os mais antigos são removidos automaticamente)
+MAX_BACKUPS = int(os.environ.get("KRI_MAX_BACKUPS", "10"))
 
 MESES = {
     "janeiro":   "2026-01-01",
@@ -32,20 +63,165 @@ ABAS_INDICADORES = {
 
 DATA_CARGA = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+log = logging.getLogger("etl_kri")
+
 
 # ==============================================================================
-# 2. BACKUP DO BANCO
+# 2. LOGGING (console com emoji + arquivo de auditoria)
 # ==============================================================================
-def fazer_backup():
-    backup = CAMINHO_DB.replace(".db", f"_backup_{datetime.now():%Y%m%d_%H%M%S}.db")
+def configurar_logging(verbose: bool = False) -> None:
+    """Console limpo (só a mensagem) + arquivo etl_kri.log com timestamp."""
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+    log.handlers.clear()
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(console)
+
+    try:
+        arquivo = logging.FileHandler(
+            Path(__file__).with_name("etl_kri.log"), encoding="utf-8"
+        )
+        arquivo.setLevel(logging.DEBUG)
+        arquivo.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s")
+        )
+        log.addHandler(arquivo)
+    except OSError:
+        # Sem permissão de escrever log em disco: segue só com console.
+        pass
+
+
+# ==============================================================================
+# 3. SCHEMA DO BANCO (DDL idempotente + índices)
+# ==============================================================================
+SCHEMA: dict[str, str] = {
+    "indicadores": """
+        CREATE TABLE IF NOT EXISTS indicadores (
+            competencia            TEXT NOT NULL,
+            bloco_risco            TEXT NOT NULL,
+            item                   INTEGER,
+            fator_risco            TEXT,
+            resumo_fator_risco     TEXT,
+            risco                  TEXT,
+            responsavel            TEXT,
+            pilares_estrategicos   TEXT,
+            metrica                TEXT,
+            memoria_calculo_meta   TEXT,
+            polaridade             TEXT,
+            frequencia_atualizacao TEXT,
+            peso_metrica           REAL,
+            peso_indicador         REAL,
+            resultado_mes          REAL,
+            nota_final             REAL,
+            resultado_comentario   TEXT,
+            arquivo_origem         TEXT,
+            data_carga             TEXT
+        )""",
+    "desequilibrio_atuarial_detalhe": """
+        CREATE TABLE IF NOT EXISTS desequilibrio_atuarial_detalhe (
+            competencia              TEXT NOT NULL,
+            item                     INTEGER,
+            fator_risco              TEXT,
+            indice_solvencia_a       REAL,
+            limite_nao_equacionar_b  REAL,
+            distancia_regulatoria_c  REAL,
+            distancia_atual_d        REAL,
+            escala_solvencia_e       REAL,
+            eps_kri                  REAL,
+            arquivo_origem           TEXT,
+            data_carga               TEXT
+        )""",
+    "farol_consolidado": """
+        CREATE TABLE IF NOT EXISTS farol_consolidado (
+            competencia        TEXT NOT NULL,
+            risco_estrategico  TEXT,
+            meta               REAL,
+            real_mes_anterior  REAL,
+            real_mes_vigente   REAL,
+            farol              REAL,
+            arquivo_origem     TEXT,
+            data_carga         TEXT
+        )""",
+    "retorno_nao_equacionar": """
+        CREATE TABLE IF NOT EXISTS retorno_nao_equacionar (
+            competencia             TEXT NOT NULL,
+            plano                   TEXT,
+            retorno_nao_equacionar  REAL,
+            arquivo_origem          TEXT,
+            data_carga              TEXT
+        )""",
+    "justificativas_indicadores": """
+        CREATE TABLE IF NOT EXISTS justificativas_indicadores (
+            competencia     TEXT NOT NULL,
+            bloco_risco     TEXT,
+            fator_risco     TEXT,
+            metrica         TEXT,
+            meta            TEXT,
+            resultado       TEXT,
+            justificativa   TEXT,
+            arquivo_origem  TEXT,
+            data_carga      TEXT
+        )""",
+}
+
+INDICES = [
+    "CREATE INDEX IF NOT EXISTS ix_ind_comp   ON indicadores(competencia)",
+    "CREATE INDEX IF NOT EXISTS ix_ind_bloco  ON indicadores(bloco_risco)",
+    "CREATE INDEX IF NOT EXISTS ix_det_comp   ON desequilibrio_atuarial_detalhe(competencia)",
+    "CREATE INDEX IF NOT EXISTS ix_farol_comp ON farol_consolidado(competencia)",
+    "CREATE INDEX IF NOT EXISTS ix_ret_comp   ON retorno_nao_equacionar(competencia)",
+    "CREATE INDEX IF NOT EXISTS ix_jus_comp   ON justificativas_indicadores(competencia)",
+]
+
+
+def garantir_schema(con: sqlite3.Connection) -> None:
+    """Cria tabelas e índices se ainda não existirem (não altera dados)."""
+    cur = con.cursor()
+    for ddl in SCHEMA.values():
+        cur.execute(ddl)
+    for idx in INDICES:
+        cur.execute(idx)
+    log.debug("Schema garantido (tabelas + índices).")
+
+
+# ==============================================================================
+# 4. BACKUP DO BANCO (seguro + retenção)
+# ==============================================================================
+def fazer_backup() -> None:
+    """Faz backup do .db. Ignora silenciosamente se ele ainda não existe."""
+    if not CAMINHO_DB.exists():
+        log.info("ℹ️  Banco ainda não existe — backup ignorado (primeira carga).")
+        return
+
+    carimbo = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = CAMINHO_DB.with_name(f"{CAMINHO_DB.stem}_backup_{carimbo}.db")
     shutil.copy2(CAMINHO_DB, backup)
-    print(f"🗄️  Backup criado: {os.path.basename(backup)}")
+    log.info(f"🗄️  Backup criado: {backup.name}")
+    _limpar_backups_antigos()
+
+
+def _limpar_backups_antigos() -> None:
+    """Mantém apenas os MAX_BACKUPS mais recentes."""
+    padrao = f"{CAMINHO_DB.stem}_backup_*.db"
+    backups = sorted(
+        CAMINHO_DB.parent.glob(padrao),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for antigo in backups[MAX_BACKUPS:]:
+        try:
+            antigo.unlink()
+            log.debug(f"🧹 Backup antigo removido: {antigo.name}")
+        except OSError:
+            pass
 
 
 # ==============================================================================
-# 3. FUNÇÕES AUXILIARES
+# 5. FUNÇÕES AUXILIARES
 # ==============================================================================
-def to_num(valor):
+def to_num(valor: Any) -> Optional[float]:
     """Converte texto/percentual em número (ou None)."""
     if pd.isna(valor):
         return None
@@ -58,15 +234,20 @@ def to_num(valor):
         return None
 
 
-def limpar_texto(valor):
+def limpar_texto(valor: Any) -> Optional[str]:
     """Remove espaços e quebras desnecessárias."""
     if pd.isna(valor):
         return None
     return str(valor).strip()
 
 
+def _cel(row: pd.Series, i: int) -> Any:
+    """Acesso seguro a uma célula da linha (None se a coluna não existe)."""
+    return row.iloc[i] if len(row) > i else None
+
+
 # ==============================================================================
-# 4. LEITURA DOS BLOCOS 2, 3, 4 (estrutura semelhante)
+# 6. LEITURA DOS BLOCOS 2, 3, 4 (estrutura semelhante)
 # ==============================================================================
 def ler_bloco_padrao(df, bloco, competencia, arquivo):
     """
@@ -86,20 +267,20 @@ def ler_bloco_padrao(df, bloco, competencia, arquivo):
             "competencia":            competencia,
             "bloco_risco":            bloco,
             "item":                   int(float(item)),
-            "fator_risco":            limpar_texto(row.iloc[1]) if len(row) > 1 else None,
-            "resumo_fator_risco":     limpar_texto(row.iloc[2]) if len(row) > 2 else None,
-            "risco":                  limpar_texto(row.iloc[3]) if len(row) > 3 else None,
-            "responsavel":            limpar_texto(row.iloc[4]) if len(row) > 4 else None,
-            "pilares_estrategicos":   limpar_texto(row.iloc[5]) if len(row) > 5 else None,
-            "metrica":                limpar_texto(row.iloc[6]) if len(row) > 6 else None,
-            "memoria_calculo_meta":   limpar_texto(row.iloc[7]) if len(row) > 7 else None,
-            "polaridade":             limpar_texto(row.iloc[8]) if len(row) > 8 else None,
-            "frequencia_atualizacao": limpar_texto(row.iloc[9]) if len(row) > 9 else None,
-            "peso_metrica":           to_num(row.iloc[10]) if len(row) > 10 else None,
-            "peso_indicador":         to_num(row.iloc[11]) if len(row) > 11 else None,
-            "resultado_mes":          to_num(row.iloc[12]) if len(row) > 12 else None,
-            "nota_final":             to_num(row.iloc[13]) if len(row) > 13 else None,
-            "resultado_comentario":   limpar_texto(row.iloc[14]) if len(row) > 14 else None,
+            "fator_risco":            limpar_texto(_cel(row, 1)),
+            "resumo_fator_risco":     limpar_texto(_cel(row, 2)),
+            "risco":                  limpar_texto(_cel(row, 3)),
+            "responsavel":            limpar_texto(_cel(row, 4)),
+            "pilares_estrategicos":   limpar_texto(_cel(row, 5)),
+            "metrica":                limpar_texto(_cel(row, 6)),
+            "memoria_calculo_meta":   limpar_texto(_cel(row, 7)),
+            "polaridade":             limpar_texto(_cel(row, 8)),
+            "frequencia_atualizacao": limpar_texto(_cel(row, 9)),
+            "peso_metrica":           to_num(_cel(row, 10)),
+            "peso_indicador":         to_num(_cel(row, 11)),
+            "resultado_mes":          to_num(_cel(row, 12)),
+            "nota_final":             to_num(_cel(row, 13)),
+            "resultado_comentario":   limpar_texto(_cel(row, 14)),
             "arquivo_origem":         arquivo,
             "data_carga":             DATA_CARGA,
         })
@@ -107,7 +288,7 @@ def ler_bloco_padrao(df, bloco, competencia, arquivo):
 
 
 # ==============================================================================
-# 5. LEITURA DO BLOCO 1 (Desequilíbrio Atuarial - estrutura diferente)
+# 7. LEITURA DO BLOCO 1 (Desequilíbrio Atuarial - estrutura diferente)
 # ==============================================================================
 def ler_bloco_1(df, competencia, arquivo):
     """Bloco 1 tem colunas extras de solvência."""
@@ -125,19 +306,19 @@ def ler_bloco_1(df, competencia, arquivo):
             "competencia":            competencia,
             "bloco_risco":            "1-Desequilíbrio Atuarial",
             "item":                   item_int,
-            "fator_risco":            limpar_texto(row.iloc[1]) if len(row) > 1 else None,
-            "resumo_fator_risco":     limpar_texto(row.iloc[2]) if len(row) > 2 else None,
-            "risco":                  limpar_texto(row.iloc[3]) if len(row) > 3 else None,
-            "responsavel":            limpar_texto(row.iloc[4]) if len(row) > 4 else None,
-            "pilares_estrategicos":   limpar_texto(row.iloc[5]) if len(row) > 5 else None,
-            "metrica":                limpar_texto(row.iloc[6]) if len(row) > 6 else None,
-            "memoria_calculo_meta":   limpar_texto(row.iloc[7]) if len(row) > 7 else None,
-            "polaridade":             limpar_texto(row.iloc[16]) if len(row) > 16 else None,
-            "frequencia_atualizacao": limpar_texto(row.iloc[17]) if len(row) > 17 else None,
+            "fator_risco":            limpar_texto(_cel(row, 1)),
+            "resumo_fator_risco":     limpar_texto(_cel(row, 2)),
+            "risco":                  limpar_texto(_cel(row, 3)),
+            "responsavel":            limpar_texto(_cel(row, 4)),
+            "pilares_estrategicos":   limpar_texto(_cel(row, 5)),
+            "metrica":                limpar_texto(_cel(row, 6)),
+            "memoria_calculo_meta":   limpar_texto(_cel(row, 7)),
+            "polaridade":             limpar_texto(_cel(row, 16)),
+            "frequencia_atualizacao": limpar_texto(_cel(row, 17)),
             "peso_metrica":           None,
-            "peso_indicador":         to_num(row.iloc[14]) if len(row) > 14 else None,
-            "resultado_mes":          to_num(row.iloc[13]) if len(row) > 13 else None,
-            "nota_final":             to_num(row.iloc[15]) if len(row) > 15 else None,
+            "peso_indicador":         to_num(_cel(row, 14)),
+            "resultado_mes":          to_num(_cel(row, 13)),
+            "nota_final":             to_num(_cel(row, 15)),
             "resultado_comentario":   None,
             "arquivo_origem":         arquivo,
             "data_carga":             DATA_CARGA,
@@ -148,12 +329,12 @@ def ler_bloco_1(df, competencia, arquivo):
             "competencia":            competencia,
             "item":                   item_int,
             "fator_risco":            limpar_texto(row.iloc[1]),
-            "indice_solvencia_a":     to_num(row.iloc[8])  if len(row) > 8  else None,
-            "limite_nao_equacionar_b":to_num(row.iloc[9])  if len(row) > 9  else None,
-            "distancia_regulatoria_c":to_num(row.iloc[10]) if len(row) > 10 else None,
-            "distancia_atual_d":      to_num(row.iloc[11]) if len(row) > 11 else None,
-            "escala_solvencia_e":     to_num(row.iloc[12]) if len(row) > 12 else None,
-            "eps_kri":                to_num(row.iloc[13]) if len(row) > 13 else None,
+            "indice_solvencia_a":     to_num(_cel(row, 8)),
+            "limite_nao_equacionar_b":to_num(_cel(row, 9)),
+            "distancia_regulatoria_c":to_num(_cel(row, 10)),
+            "distancia_atual_d":      to_num(_cel(row, 11)),
+            "escala_solvencia_e":     to_num(_cel(row, 12)),
+            "eps_kri":                to_num(_cel(row, 13)),
             "arquivo_origem":         arquivo,
             "data_carga":             DATA_CARGA,
         })
@@ -161,7 +342,7 @@ def ler_bloco_1(df, competencia, arquivo):
 
 
 # ==============================================================================
-# 6. LEITURA DA ABA FAROL
+# 8. LEITURA DA ABA FAROL
 # ==============================================================================
 def ler_farol(df, competencia, arquivo):
     linhas = []
@@ -175,10 +356,10 @@ def ler_farol(df, competencia, arquivo):
         linhas.append({
             "competencia":      competencia,
             "risco_estrategico":nome,
-            "meta":             to_num(row.iloc[1]) if len(row) > 1 else None,
-            "real_mes_anterior":to_num(row.iloc[2]) if len(row) > 2 else None,
-            "real_mes_vigente": to_num(row.iloc[3]) if len(row) > 3 else None,
-            "farol":            to_num(row.iloc[4]) if len(row) > 4 else None,
+            "meta":             to_num(_cel(row, 1)),
+            "real_mes_anterior":to_num(_cel(row, 2)),
+            "real_mes_vigente": to_num(_cel(row, 3)),
+            "farol":            to_num(_cel(row, 4)),
             "arquivo_origem":   arquivo,
             "data_carga":       DATA_CARGA,
         })
@@ -186,13 +367,13 @@ def ler_farol(df, competencia, arquivo):
 
 
 # ==============================================================================
-# 7. LEITURA RETORNO NÃO EQUACIONAR (só em jan/fev)
+# 9. LEITURA RETORNO NÃO EQUACIONAR (só em jan/fev)
 # ==============================================================================
 def ler_retorno_nao_equacionar(df, competencia, arquivo):
     linhas = []
     for _, row in df.iterrows():
         plano = limpar_texto(row.iloc[0])
-        retorno = to_num(row.iloc[1]) if len(row) > 1 else None
+        retorno = to_num(_cel(row, 1))
         if not plano or plano.upper() == "PLANO" or retorno is None:
             continue
         linhas.append({
@@ -206,14 +387,17 @@ def ler_retorno_nao_equacionar(df, competencia, arquivo):
 
 
 # ==============================================================================
-# 8. LEITURA DAS JUSTIFICATIVAS
+# 10. LEITURA DAS JUSTIFICATIVAS
 # ==============================================================================
 def ler_justificativas(arquivo_path, competencia, nome_arquivo):
     linhas = []
+    if not Path(arquivo_path).exists():
+        log.warning(f"   ⚠️  Justificativas não encontradas: {nome_arquivo}")
+        return linhas
     try:
         abas = pd.read_excel(arquivo_path, sheet_name=None, engine="openpyxl", header=None)
-    except FileNotFoundError:
-        print(f"   ⚠️  Justificativas não encontradas: {nome_arquivo}")
+    except Exception as e:  # arquivo corrompido / formato inesperado
+        log.warning(f"   ⚠️  Erro lendo justificativas {nome_arquivo}: {e}")
         return linhas
 
     for nome_aba, df in abas.items():
@@ -227,10 +411,10 @@ def ler_justificativas(arquivo_path, competencia, nome_arquivo):
                 "competencia":   competencia,
                 "bloco_risco":   bloco,
                 "fator_risco":   fator,
-                "metrica":       limpar_texto(row.iloc[1]) if len(row) > 1 else None,
-                "meta":          limpar_texto(row.iloc[2]) if len(row) > 2 else None,
-                "resultado":     limpar_texto(row.iloc[3]) if len(row) > 3 else None,
-                "justificativa": limpar_texto(row.iloc[4]) if len(row) > 4 else None,
+                "metrica":       limpar_texto(_cel(row, 1)),
+                "meta":          limpar_texto(_cel(row, 2)),
+                "resultado":     limpar_texto(_cel(row, 3)),
+                "justificativa": limpar_texto(_cel(row, 4)),
                 "arquivo_origem":nome_arquivo,
                 "data_carga":    DATA_CARGA,
             })
@@ -238,29 +422,33 @@ def ler_justificativas(arquivo_path, competencia, nome_arquivo):
 
 
 # ==============================================================================
-# 9. LOOP PRINCIPAL
+# 11. LOOP PRINCIPAL
 # ==============================================================================
-def processar_tudo():
+def processar_tudo(meses: dict[str, str]):
     todos_indicadores = []
     todos_detalhes    = []
     todos_farol       = []
     todos_retorno     = []
     todas_justificativas = []
 
-    for mes, competencia in MESES.items():
+    for mes, competencia in meses.items():
         nome_ind = f"Indicadores {mes}.xlsx"
         nome_jus = f"justificativas {mes}.xlsx"
-        path_ind = os.path.join(PASTA_BASES, nome_ind)
-        path_jus = os.path.join(PASTA_BASES, nome_jus)
+        path_ind = PASTA_BASES / nome_ind
+        path_jus = PASTA_BASES / nome_jus
 
-        if not os.path.exists(path_ind):
-            print(f"❌ Arquivo não encontrado: {nome_ind}")
+        if not path_ind.exists():
+            log.warning(f"❌ Arquivo não encontrado: {nome_ind}")
             continue
 
-        print(f"\n📂 Processando {mes.upper()}...")
+        log.info(f"\n📂 Processando {mes.upper()}...")
 
         # Lê todas as abas do Indicadores
-        abas = pd.read_excel(path_ind, sheet_name=None, engine="openpyxl", header=None)
+        try:
+            abas = pd.read_excel(path_ind, sheet_name=None, engine="openpyxl", header=None)
+        except Exception as e:
+            log.error(f"   ❌ Falha ao abrir {nome_ind}: {e}")
+            continue
 
         for nome_aba, df in abas.items():
             aba_limpa = nome_aba.strip()
@@ -269,101 +457,225 @@ def processar_tudo():
                 ind, det = ler_bloco_1(df, competencia, nome_ind)
                 todos_indicadores.extend(ind)
                 todos_detalhes.extend(det)
-                print(f"   ✅ Bloco 1: {len(ind)} indicadores")
+                log.info(f"   ✅ Bloco 1: {len(ind)} indicadores")
 
             elif aba_limpa.startswith("2-"):
                 ind = ler_bloco_padrao(df, "2-Legal, Regulatório e Governança", competencia, nome_ind)
                 todos_indicadores.extend(ind)
-                print(f"   ✅ Bloco 2: {len(ind)} indicadores")
+                log.info(f"   ✅ Bloco 2: {len(ind)} indicadores")
 
             elif aba_limpa.startswith("3 -") or aba_limpa.startswith("3-"):
                 ind = ler_bloco_padrao(df, "3-Cibernético e Tecnologia", competencia, nome_ind)
                 todos_indicadores.extend(ind)
-                print(f"   ✅ Bloco 3: {len(ind)} indicadores")
+                log.info(f"   ✅ Bloco 3: {len(ind)} indicadores")
 
             elif aba_limpa.startswith("4-"):
                 ind = ler_bloco_padrao(df, "4-Ineficiência Operacional", competencia, nome_ind)
                 todos_indicadores.extend(ind)
-                print(f"   ✅ Bloco 4: {len(ind)} indicadores")
+                log.info(f"   ✅ Bloco 4: {len(ind)} indicadores")
 
             elif "farol" in aba_limpa.lower() or "planilha2" in aba_limpa.lower():
                 f = ler_farol(df, competencia, nome_ind)
                 todos_farol.extend(f)
-                print(f"   ✅ Farol: {len(f)} linhas")
+                log.info(f"   ✅ Farol: {len(f)} linhas")
 
             elif aba_limpa.lower() == "planilha1":
                 r = ler_retorno_nao_equacionar(df, competencia, nome_ind)
                 todos_retorno.extend(r)
-                print(f"   ✅ Retorno: {len(r)} linhas")
+                log.info(f"   ✅ Retorno: {len(r)} linhas")
 
         # Justificativas
         j = ler_justificativas(path_jus, competencia, nome_jus)
         todas_justificativas.extend(j)
-        print(f"   ✅ Justificativas: {len(j)} linhas")
+        log.info(f"   ✅ Justificativas: {len(j)} linhas")
 
     return todos_indicadores, todos_detalhes, todos_farol, todos_retorno, todas_justificativas
 
 
 # ==============================================================================
-# 10. GRAVAÇÃO NO BANCO
+# 12. VALIDAÇÃO / QUALIDADE DOS DADOS
 # ==============================================================================
-def gravar_no_banco(indicadores, detalhes, farol, retorno, justificativas):
-    con = sqlite3.connect(CAMINHO_DB)
-    cur = con.cursor()
+def validar_dados(indicadores, farol) -> list[str]:
+    """Checagens leves de sanidade. Retorna lista de avisos (não interrompe)."""
+    avisos: list[str] = []
 
-    competencias = list(MESES.values())
+    # Indicadores sem nota final
+    sem_nota = [i for i in indicadores if i["nota_final"] is None]
+    if sem_nota:
+        avisos.append(f"{len(sem_nota)} indicador(es) sem nota_final.")
+
+    # Notas fora da faixa esperada (0–10)
+    fora = [i for i in indicadores
+            if i["nota_final"] is not None and not (0 <= i["nota_final"] <= 10)]
+    if fora:
+        avisos.append(f"{len(fora)} indicador(es) com nota_final fora de 0–10.")
+
+    # Duplicidade (competencia + bloco + item)
+    vistos = set()
+    dups = 0
+    for i in indicadores:
+        chave = (i["competencia"], i["bloco_risco"], i["item"])
+        if chave in vistos:
+            dups += 1
+        vistos.add(chave)
+    if dups:
+        avisos.append(f"{dups} indicador(es) duplicado(s) (competência+bloco+item).")
+
+    # Farol sem valor de farol
+    farol_vazio = [f for f in farol if f["farol"] is None]
+    if farol_vazio:
+        avisos.append(f"{len(farol_vazio)} linha(s) de farol sem valor de farol.")
+
+    return avisos
+
+
+# ==============================================================================
+# 13. GRAVAÇÃO NO BANCO (transação atômica)
+# ==============================================================================
+def _inserir(cur: sqlite3.Cursor, tabela: str, dados: list[dict]) -> int:
+    """Insert em lote (executemany) dentro da transação corrente."""
+    if not dados:
+        log.info(f"   ⚠️  Sem dados pra {tabela}")
+        return 0
+    colunas = list(dados[0].keys())
+    placeholders = ",".join(["?"] * len(colunas))
+    sql = f"INSERT INTO {tabela} ({','.join(colunas)}) VALUES ({placeholders})"
+    valores = [tuple(linha.get(c) for c in colunas) for linha in dados]
+    cur.executemany(sql, valores)
+    log.info(f"   ✅ {tabela}: {len(valores)} linhas inseridas")
+    return len(valores)
+
+
+def gravar_no_banco(indicadores, detalhes, farol, retorno, justificativas,
+                    meses: dict[str, str]) -> None:
+    """
+    Recarrega de forma ATÔMICA as competências processadas:
+    todo o delete + insert ocorre numa única transação. Qualquer erro
+    faz rollback completo — nunca deixa o banco num estado parcial.
+    """
+    CAMINHO_DB.parent.mkdir(parents=True, exist_ok=True)
+
+    tabelas = {
+        "indicadores": indicadores,
+        "desequilibrio_atuarial_detalhe": detalhes,
+        "farol_consolidado": farol,
+        "retorno_nao_equacionar": retorno,
+        "justificativas_indicadores": justificativas,
+    }
+
+    competencias = list(meses.values())
     placeholders = ",".join(["?"] * len(competencias))
 
-    # Limpa as competências que vamos recarregar
-    for tabela in ["indicadores", "desequilibrio_atuarial_detalhe", "farol_consolidado",
-                   "retorno_nao_equacionar", "justificativas_indicadores"]:
+    with closing(sqlite3.connect(CAMINHO_DB)) as con:
+        garantir_schema(con)
         try:
-            cur.execute(f"DELETE FROM {tabela} WHERE competencia IN ({placeholders})", competencias)
-            print(f"🗑️  {tabela}: {cur.rowcount} linhas antigas removidas")
-        except sqlite3.OperationalError as e:
-            print(f"⚠️  {tabela}: {e}")
+            cur = con.cursor()
 
-    con.commit()
+            # 1) Limpa as competências que vamos recarregar
+            for tabela in tabelas:
+                cur.execute(
+                    f"DELETE FROM {tabela} WHERE competencia IN ({placeholders})",
+                    competencias,
+                )
+                log.info(f"🗑️  {tabela}: {cur.rowcount} linhas antigas removidas")
 
-    # Insere os novos dados
-    def insert_df(nome, dados):
-        if not dados:
-            print(f"   ⚠️  Sem dados pra {nome}")
-            return
-        df = pd.DataFrame(dados)
-        df.to_sql(nome, con, if_exists="append", index=False)
-        print(f"   ✅ {nome}: {len(df)} linhas inseridas")
+            # 2) Insere os dados novos
+            log.info("\n💾 Inserindo dados novos...")
+            for tabela, dados in tabelas.items():
+                _inserir(cur, tabela, dados)
 
-    print("\n💾 Inserindo dados novos...")
-    insert_df("indicadores", indicadores)
-    insert_df("desequilibrio_atuarial_detalhe", detalhes)
-    insert_df("farol_consolidado", farol)
-    insert_df("retorno_nao_equacionar", retorno)
-    insert_df("justificativas_indicadores", justificativas)
-
-    con.close()
+            con.commit()  # tudo ou nada
+            log.info("✅ Transação confirmada (commit).")
+        except Exception:
+            con.rollback()
+            log.error("❌ Erro na gravação — rollback executado, banco intacto.")
+            raise
 
 
 # ==============================================================================
-# 11. EXECUÇÃO
+# 14. CLI
 # ==============================================================================
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="ETL Indicadores KRI - Petros (Excel → SQLite).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--meses", nargs="+", metavar="MÊS", choices=list(MESES.keys()),
+        help="Meses a processar (padrão: todos).",
+    )
+    p.add_argument("--pasta", type=Path, help="Pasta das planilhas (override).")
+    p.add_argument("--db", type=Path, help="Caminho do banco SQLite (override).")
+    p.add_argument("--no-backup", action="store_true", help="Não fazer backup do banco.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Processa e valida, mas NÃO grava no banco.")
+    p.add_argument("-v", "--verbose", action="store_true", help="Log detalhado (debug).")
+    return p.parse_args(argv)
+
+
+# ==============================================================================
+# 15. EXECUÇÃO
+# ==============================================================================
+def main(argv: Optional[list[str]] = None) -> int:
+    global PASTA_BASES, CAMINHO_DB
+    args = parse_args(argv)
+    configurar_logging(args.verbose)
+
+    if args.pasta:
+        PASTA_BASES = args.pasta
+    if args.db:
+        CAMINHO_DB = args.db
+
+    meses = {m: MESES[m] for m in args.meses} if args.meses else dict(MESES)
+
+    log.info("=" * 60)
+    log.info("🚀 ETL INDICADORES KRI - PETROS")
+    log.info("=" * 60)
+    log.info(f"📁 Pasta : {PASTA_BASES}")
+    log.info(f"🗃️  Banco : {CAMINHO_DB}")
+    log.info(f"📅 Meses : {', '.join(meses)}")
+    if args.dry_run:
+        log.info("🧪 MODO DRY-RUN — nada será gravado.")
+
+    if not PASTA_BASES.exists():
+        log.error(f"❌ Pasta de bases não existe: {PASTA_BASES}")
+        return 2
+
+    if not args.dry_run and not args.no_backup:
+        fazer_backup()
+
+    indicadores, detalhes, farol, retorno, justificativas = processar_tudo(meses)
+
+    log.info("\n" + "=" * 60)
+    log.info("📊 RESUMO")
+    log.info("=" * 60)
+    log.info(f"   Indicadores:       {len(indicadores)} linhas")
+    log.info(f"   Detalhes solv.:    {len(detalhes)} linhas")
+    log.info(f"   Farol:             {len(farol)} linhas")
+    log.info(f"   Retorno (jan/fev): {len(retorno)} linhas")
+    log.info(f"   Justificativas:    {len(justificativas)} linhas")
+
+    # Qualidade dos dados
+    avisos = validar_dados(indicadores, farol)
+    if avisos:
+        log.info("\n🔎 QUALIDADE DOS DADOS:")
+        for a in avisos:
+            log.warning(f"   ⚠️  {a}")
+    else:
+        log.info("\n🔎 Qualidade: nenhum problema detectado. 👍")
+
+    if not (indicadores or detalhes or farol or retorno or justificativas):
+        log.error("\n❌ Nada foi processado — verifique a pasta e os nomes dos arquivos.")
+        return 1
+
+    if args.dry_run:
+        log.info("\n🧪 Dry-run concluído — banco NÃO foi alterado.")
+        return 0
+
+    gravar_no_banco(indicadores, detalhes, farol, retorno, justificativas, meses)
+    log.info("\n🎉 ETL concluído com sucesso!")
+    return 0
+
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print("🚀 ETL INDICADORES KRI - PETROS")
-    print("=" * 60)
-
-    fazer_backup()
-    indicadores, detalhes, farol, retorno, justificativas = processar_tudo()
-
-    print("\n" + "=" * 60)
-    print("📊 RESUMO")
-    print("=" * 60)
-    print(f"   Indicadores:     {len(indicadores)} linhas")
-    print(f"   Detalhes solv.:  {len(detalhes)} linhas")
-    print(f"   Farol:           {len(farol)} linhas")
-    print(f"   Retorno (jan/fev): {len(retorno)} linhas")
-    print(f"   Justificativas:  {len(justificativas)} linhas")
-
-    gravar_no_banco(indicadores, detalhes, farol, retorno, justificativas)
-
-    print("\n🎉 ETL concluído com sucesso!")
+    sys.exit(main())

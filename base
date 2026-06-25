@@ -1,0 +1,369 @@
+# ==============================================================================
+# ETL COMPLETO - Indicadores KRI Petros
+# Carrega: Indicadores [mês].xlsx + justificativas [mês].xlsx → indicadores_kri.db
+# ==============================================================================
+import os
+import shutil
+import sqlite3
+from datetime import datetime
+import pandas as pd
+
+# ==============================================================================
+# 1. CONFIGURAÇÃO
+# ==============================================================================
+PASTA_BASES = r"F:\DADOS\GRC\Gestão de Riscos\0. Apartir de 2018\1. Equipe\21. Eduardo\Sinaleiro Estratégico\bases"
+CAMINHO_DB  = r"F:\DADOS\GRC\Gestão de Riscos\0. Apartir de 2018\1. Equipe\21. Eduardo\indicadores_kri.db"
+
+MESES = {
+    "janeiro":   "2026-01-01",
+    "fevereiro": "2026-02-01",
+    "março":     "2026-03-01",
+    "abril":     "2026-04-01",
+    "maio":      "2026-05-01",
+}
+
+# Mapeamento das abas de Indicadores (nome da aba → bloco)
+ABAS_INDICADORES = {
+    "1-Desequilíbrio Atuarial":     "1-Desequilíbrio Atuarial",
+    "2- Legal, Reg. e Governança":  "2-Legal, Regulatório e Governança",
+    "3 -  Cibernético e Tecnologia":"3-Cibernético e Tecnologia",
+    "4- Inef. Operacinal":          "4-Ineficiência Operacional",
+}
+
+DATA_CARGA = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ==============================================================================
+# 2. BACKUP DO BANCO
+# ==============================================================================
+def fazer_backup():
+    backup = CAMINHO_DB.replace(".db", f"_backup_{datetime.now():%Y%m%d_%H%M%S}.db")
+    shutil.copy2(CAMINHO_DB, backup)
+    print(f"🗄️  Backup criado: {os.path.basename(backup)}")
+
+
+# ==============================================================================
+# 3. FUNÇÕES AUXILIARES
+# ==============================================================================
+def to_num(valor):
+    """Converte texto/percentual em número (ou None)."""
+    if pd.isna(valor):
+        return None
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    s = str(valor).strip().replace("%", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def limpar_texto(valor):
+    """Remove espaços e quebras desnecessárias."""
+    if pd.isna(valor):
+        return None
+    return str(valor).strip()
+
+
+# ==============================================================================
+# 4. LEITURA DOS BLOCOS 2, 3, 4 (estrutura semelhante)
+# ==============================================================================
+def ler_bloco_padrao(df, bloco, competencia, arquivo):
+    """
+    Lê blocos 2, 3, 4 — colunas:
+    item | fator_risco | resumo | risco | responsavel | pilares | metrica
+    | memoria | polaridade | frequencia | peso_metrica | peso_indicador
+    | resultado_mes | nota_final | comentario [| justificativa]
+    """
+    linhas = []
+    for _, row in df.iterrows():
+        item = row.iloc[0]
+        # só linhas que têm número no item
+        if pd.isna(item) or not str(item).strip().replace(".", "").isdigit():
+            continue
+
+        linhas.append({
+            "competencia":            competencia,
+            "bloco_risco":            bloco,
+            "item":                   int(float(item)),
+            "fator_risco":            limpar_texto(row.iloc[1]) if len(row) > 1 else None,
+            "resumo_fator_risco":     limpar_texto(row.iloc[2]) if len(row) > 2 else None,
+            "risco":                  limpar_texto(row.iloc[3]) if len(row) > 3 else None,
+            "responsavel":            limpar_texto(row.iloc[4]) if len(row) > 4 else None,
+            "pilares_estrategicos":   limpar_texto(row.iloc[5]) if len(row) > 5 else None,
+            "metrica":                limpar_texto(row.iloc[6]) if len(row) > 6 else None,
+            "memoria_calculo_meta":   limpar_texto(row.iloc[7]) if len(row) > 7 else None,
+            "polaridade":             limpar_texto(row.iloc[8]) if len(row) > 8 else None,
+            "frequencia_atualizacao": limpar_texto(row.iloc[9]) if len(row) > 9 else None,
+            "peso_metrica":           to_num(row.iloc[10]) if len(row) > 10 else None,
+            "peso_indicador":         to_num(row.iloc[11]) if len(row) > 11 else None,
+            "resultado_mes":          to_num(row.iloc[12]) if len(row) > 12 else None,
+            "nota_final":             to_num(row.iloc[13]) if len(row) > 13 else None,
+            "resultado_comentario":   limpar_texto(row.iloc[14]) if len(row) > 14 else None,
+            "arquivo_origem":         arquivo,
+            "data_carga":             DATA_CARGA,
+        })
+    return linhas
+
+
+# ==============================================================================
+# 5. LEITURA DO BLOCO 1 (Desequilíbrio Atuarial - estrutura diferente)
+# ==============================================================================
+def ler_bloco_1(df, competencia, arquivo):
+    """Bloco 1 tem colunas extras de solvência."""
+    linhas = []
+    detalhes = []
+    for _, row in df.iterrows():
+        item = row.iloc[0]
+        if pd.isna(item) or not str(item).strip().replace(".", "").isdigit():
+            continue
+
+        item_int = int(float(item))
+
+        # Tabela `indicadores`
+        linhas.append({
+            "competencia":            competencia,
+            "bloco_risco":            "1-Desequilíbrio Atuarial",
+            "item":                   item_int,
+            "fator_risco":            limpar_texto(row.iloc[1]) if len(row) > 1 else None,
+            "resumo_fator_risco":     limpar_texto(row.iloc[2]) if len(row) > 2 else None,
+            "risco":                  limpar_texto(row.iloc[3]) if len(row) > 3 else None,
+            "responsavel":            limpar_texto(row.iloc[4]) if len(row) > 4 else None,
+            "pilares_estrategicos":   limpar_texto(row.iloc[5]) if len(row) > 5 else None,
+            "metrica":                limpar_texto(row.iloc[6]) if len(row) > 6 else None,
+            "memoria_calculo_meta":   limpar_texto(row.iloc[7]) if len(row) > 7 else None,
+            "polaridade":             limpar_texto(row.iloc[16]) if len(row) > 16 else None,
+            "frequencia_atualizacao": limpar_texto(row.iloc[17]) if len(row) > 17 else None,
+            "peso_metrica":           None,
+            "peso_indicador":         to_num(row.iloc[14]) if len(row) > 14 else None,
+            "resultado_mes":          to_num(row.iloc[13]) if len(row) > 13 else None,
+            "nota_final":             to_num(row.iloc[15]) if len(row) > 15 else None,
+            "resultado_comentario":   None,
+            "arquivo_origem":         arquivo,
+            "data_carga":             DATA_CARGA,
+        })
+
+        # Tabela `desequilibrio_atuarial_detalhe`
+        detalhes.append({
+            "competencia":            competencia,
+            "item":                   item_int,
+            "fator_risco":            limpar_texto(row.iloc[1]),
+            "indice_solvencia_a":     to_num(row.iloc[8])  if len(row) > 8  else None,
+            "limite_nao_equacionar_b":to_num(row.iloc[9])  if len(row) > 9  else None,
+            "distancia_regulatoria_c":to_num(row.iloc[10]) if len(row) > 10 else None,
+            "distancia_atual_d":      to_num(row.iloc[11]) if len(row) > 11 else None,
+            "escala_solvencia_e":     to_num(row.iloc[12]) if len(row) > 12 else None,
+            "eps_kri":                to_num(row.iloc[13]) if len(row) > 13 else None,
+            "arquivo_origem":         arquivo,
+            "data_carga":             DATA_CARGA,
+        })
+    return linhas, detalhes
+
+
+# ==============================================================================
+# 6. LEITURA DA ABA FAROL
+# ==============================================================================
+def ler_farol(df, competencia, arquivo):
+    linhas = []
+    for _, row in df.iterrows():
+        nome = limpar_texto(row.iloc[0])
+        if not nome or "RISCO" in str(nome).upper() or "LEGENDA" in str(nome).upper():
+            continue
+        if not any(c.isdigit() for c in str(nome)[:3]):
+            continue
+
+        linhas.append({
+            "competencia":      competencia,
+            "risco_estrategico":nome,
+            "meta":             to_num(row.iloc[1]) if len(row) > 1 else None,
+            "real_mes_anterior":to_num(row.iloc[2]) if len(row) > 2 else None,
+            "real_mes_vigente": to_num(row.iloc[3]) if len(row) > 3 else None,
+            "farol":            to_num(row.iloc[4]) if len(row) > 4 else None,
+            "arquivo_origem":   arquivo,
+            "data_carga":       DATA_CARGA,
+        })
+    return linhas
+
+
+# ==============================================================================
+# 7. LEITURA RETORNO NÃO EQUACIONAR (só em jan/fev)
+# ==============================================================================
+def ler_retorno_nao_equacionar(df, competencia, arquivo):
+    linhas = []
+    for _, row in df.iterrows():
+        plano = limpar_texto(row.iloc[0])
+        retorno = to_num(row.iloc[1]) if len(row) > 1 else None
+        if not plano or plano.upper() == "PLANO" or retorno is None:
+            continue
+        linhas.append({
+            "competencia":            competencia,
+            "plano":                  plano,
+            "retorno_nao_equacionar": retorno,
+            "arquivo_origem":         arquivo,
+            "data_carga":             DATA_CARGA,
+        })
+    return linhas
+
+
+# ==============================================================================
+# 8. LEITURA DAS JUSTIFICATIVAS
+# ==============================================================================
+def ler_justificativas(arquivo_path, competencia, nome_arquivo):
+    linhas = []
+    try:
+        abas = pd.read_excel(arquivo_path, sheet_name=None, engine="openpyxl", header=None)
+    except FileNotFoundError:
+        print(f"   ⚠️  Justificativas não encontradas: {nome_arquivo}")
+        return linhas
+
+    for nome_aba, df in abas.items():
+        bloco = "3-Cibernético e Tecnologia" if "ciber" in nome_aba.lower() else "4-Ineficiência Operacional"
+        # pula header (geralmente 2 primeiras linhas)
+        for _, row in df.iloc[2:].iterrows():
+            fator = limpar_texto(row.iloc[0])
+            if not fator or "FATOR" in str(fator).upper() or "DESENQUADROU" in str(fator).upper():
+                continue
+            linhas.append({
+                "competencia":   competencia,
+                "bloco_risco":   bloco,
+                "fator_risco":   fator,
+                "metrica":       limpar_texto(row.iloc[1]) if len(row) > 1 else None,
+                "meta":          limpar_texto(row.iloc[2]) if len(row) > 2 else None,
+                "resultado":     limpar_texto(row.iloc[3]) if len(row) > 3 else None,
+                "justificativa": limpar_texto(row.iloc[4]) if len(row) > 4 else None,
+                "arquivo_origem":nome_arquivo,
+                "data_carga":    DATA_CARGA,
+            })
+    return linhas
+
+
+# ==============================================================================
+# 9. LOOP PRINCIPAL
+# ==============================================================================
+def processar_tudo():
+    todos_indicadores = []
+    todos_detalhes    = []
+    todos_farol       = []
+    todos_retorno     = []
+    todas_justificativas = []
+
+    for mes, competencia in MESES.items():
+        nome_ind = f"Indicadores {mes}.xlsx"
+        nome_jus = f"justificativas {mes}.xlsx"
+        path_ind = os.path.join(PASTA_BASES, nome_ind)
+        path_jus = os.path.join(PASTA_BASES, nome_jus)
+
+        if not os.path.exists(path_ind):
+            print(f"❌ Arquivo não encontrado: {nome_ind}")
+            continue
+
+        print(f"\n📂 Processando {mes.upper()}...")
+
+        # Lê todas as abas do Indicadores
+        abas = pd.read_excel(path_ind, sheet_name=None, engine="openpyxl", header=None)
+
+        for nome_aba, df in abas.items():
+            aba_limpa = nome_aba.strip()
+
+            if aba_limpa == "1-Desequilíbrio Atuarial":
+                ind, det = ler_bloco_1(df, competencia, nome_ind)
+                todos_indicadores.extend(ind)
+                todos_detalhes.extend(det)
+                print(f"   ✅ Bloco 1: {len(ind)} indicadores")
+
+            elif aba_limpa.startswith("2-"):
+                ind = ler_bloco_padrao(df, "2-Legal, Regulatório e Governança", competencia, nome_ind)
+                todos_indicadores.extend(ind)
+                print(f"   ✅ Bloco 2: {len(ind)} indicadores")
+
+            elif aba_limpa.startswith("3 -") or aba_limpa.startswith("3-"):
+                ind = ler_bloco_padrao(df, "3-Cibernético e Tecnologia", competencia, nome_ind)
+                todos_indicadores.extend(ind)
+                print(f"   ✅ Bloco 3: {len(ind)} indicadores")
+
+            elif aba_limpa.startswith("4-"):
+                ind = ler_bloco_padrao(df, "4-Ineficiência Operacional", competencia, nome_ind)
+                todos_indicadores.extend(ind)
+                print(f"   ✅ Bloco 4: {len(ind)} indicadores")
+
+            elif "farol" in aba_limpa.lower() or "planilha2" in aba_limpa.lower():
+                f = ler_farol(df, competencia, nome_ind)
+                todos_farol.extend(f)
+                print(f"   ✅ Farol: {len(f)} linhas")
+
+            elif aba_limpa.lower() == "planilha1":
+                r = ler_retorno_nao_equacionar(df, competencia, nome_ind)
+                todos_retorno.extend(r)
+                print(f"   ✅ Retorno: {len(r)} linhas")
+
+        # Justificativas
+        j = ler_justificativas(path_jus, competencia, nome_jus)
+        todas_justificativas.extend(j)
+        print(f"   ✅ Justificativas: {len(j)} linhas")
+
+    return todos_indicadores, todos_detalhes, todos_farol, todos_retorno, todas_justificativas
+
+
+# ==============================================================================
+# 10. GRAVAÇÃO NO BANCO
+# ==============================================================================
+def gravar_no_banco(indicadores, detalhes, farol, retorno, justificativas):
+    con = sqlite3.connect(CAMINHO_DB)
+    cur = con.cursor()
+
+    competencias = list(MESES.values())
+    placeholders = ",".join(["?"] * len(competencias))
+
+    # Limpa as competências que vamos recarregar
+    for tabela in ["indicadores", "desequilibrio_atuarial_detalhe", "farol_consolidado",
+                   "retorno_nao_equacionar", "justificativas_indicadores"]:
+        try:
+            cur.execute(f"DELETE FROM {tabela} WHERE competencia IN ({placeholders})", competencias)
+            print(f"🗑️  {tabela}: {cur.rowcount} linhas antigas removidas")
+        except sqlite3.OperationalError as e:
+            print(f"⚠️  {tabela}: {e}")
+
+    con.commit()
+
+    # Insere os novos dados
+    def insert_df(nome, dados):
+        if not dados:
+            print(f"   ⚠️  Sem dados pra {nome}")
+            return
+        df = pd.DataFrame(dados)
+        df.to_sql(nome, con, if_exists="append", index=False)
+        print(f"   ✅ {nome}: {len(df)} linhas inseridas")
+
+    print("\n💾 Inserindo dados novos...")
+    insert_df("indicadores", indicadores)
+    insert_df("desequilibrio_atuarial_detalhe", detalhes)
+    insert_df("farol_consolidado", farol)
+    insert_df("retorno_nao_equacionar", retorno)
+    insert_df("justificativas_indicadores", justificativas)
+
+    con.close()
+
+
+# ==============================================================================
+# 11. EXECUÇÃO
+# ==============================================================================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🚀 ETL INDICADORES KRI - PETROS")
+    print("=" * 60)
+
+    fazer_backup()
+    indicadores, detalhes, farol, retorno, justificativas = processar_tudo()
+
+    print("\n" + "=" * 60)
+    print("📊 RESUMO")
+    print("=" * 60)
+    print(f"   Indicadores:     {len(indicadores)} linhas")
+    print(f"   Detalhes solv.:  {len(detalhes)} linhas")
+    print(f"   Farol:           {len(farol)} linhas")
+    print(f"   Retorno (jan/fev): {len(retorno)} linhas")
+    print(f"   Justificativas:  {len(justificativas)} linhas")
+
+    gravar_no_banco(indicadores, detalhes, farol, retorno, justificativas)
+
+    print("\n🎉 ETL concluído com sucesso!")
